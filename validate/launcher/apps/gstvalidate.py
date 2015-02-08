@@ -27,7 +27,7 @@ from launcher.loggable import Loggable
 from launcher.baseclasses import GstValidateTest, Test, \
     ScenarioManager, NamedDic, GstValidateTestsGenerator, \
     GstValidateMediaDescriptor, GstValidateEncodingTestInterface, \
-    GstValidateBaseTestManager
+    GstValidateBaseTestManager, MediaDescriptor
 
 from launcher.utils import path2url, DEFAULT_TIMEOUT, which, \
     GST_SECOND, Result, Protocols, mkdir, printc, Colors
@@ -108,6 +108,44 @@ class GstValidateTranscodingTestsGenerator(GstValidateTestsGenerator):
                                                          mediainfo.media_descriptor))
 
 
+class FakeMediaDescriptor(MediaDescriptor):
+    def __init__(self, infos, pipeline_desc):
+        MediaDescriptor.__init__(self)
+        self._infos = infos
+        self._pipeline_desc = pipeline_desc
+
+    def get_path(self):
+        return self._infos.get('path', None)
+
+    def get_media_filepath(self):
+        return self._infos.get('media-filepath', None)
+
+    def get_caps(self):
+        return self._infos.get('caps', None)
+
+    def get_uri(self):
+        return self._infos.get('uri', None)
+
+    def get_duration(self):
+        return int(self._infos.get('duration', 0)) * GST_SECOND
+
+    def get_protocol(self):
+        return self._infos.get('protocol', "launch_pipeline")
+
+    def is_seekable(self):
+        return self._infos.get('is-seekable', True)
+
+    def is_image(self):
+        return self._infos.get('is-image', False)
+
+    def get_num_tracks(self, track_type):
+        return self._infos.get('num-%s-tracks' % track_type,
+                               self._pipeline_desc.count(track_type + "sink"))
+
+    def can_play_reverse(self):
+        return self._infos.get('plays-reverse', False)
+
+
 class GstValidatePipelineTestsGenerator(GstValidateTestsGenerator):
 
     def __init__(self, name, test_manager, pipeline_template=None,
@@ -116,7 +154,13 @@ class GstValidatePipelineTestsGenerator(GstValidateTestsGenerator):
         @name: The name of the generator
         @pipeline_template: A template pipeline to be used to generate actual pipelines
         @pipelines_descriptions: A list of tuple of the form:
-                                 (test_name, pipeline_description)
+                                 (test_name, pipeline_description, extra_data)
+                                 extra_data being a dictionnary with the follwing keys:
+                                    'scenarios': ["the", "valide", "scenarios", "names"]
+                                    'duration': the_duration # in seconds
+                                    'timeout': a_timeout # in seconds
+                                    'hard_timeout': a_hard_timeout # in seconds
+
         @valid_scenarios: A list of scenario name that can be used with that generator
         """
         GstValidateTestsGenerator.__init__(self, name, test_manager)
@@ -136,26 +180,57 @@ class GstValidatePipelineTestsGenerator(GstValidateTestsGenerator):
         if scenario is not None and scenario.name.lower() != "none":
             return "%s.%s%s.%s" % ("validate", protocol_str, name, scenario.name)
 
-        return "%s.%s%s" % ("validate", protocol_str, name)
+        return ("%s.%s.%s.%s" % ("validate", protocol_str, self.name, name)).replace("..", ".")
 
     def generate_tests(self, uri_minfo_special_scenarios, scenarios):
-
-        if self._valid_scenarios:
+        if self._valid_scenarios is None:
+            scenarios = [None]
+        elif self._valid_scenarios:
             scenarios = [scenario for scenario in scenarios if
-                         scenario.name in self._valid_scenarios]
+                         scenario is not None and scenario.name in self._valid_scenarios]
 
         return super(GstValidatePipelineTestsGenerator, self).generate_tests(
             uri_minfo_special_scenarios, scenarios)
 
     def populate_tests(self, uri_minfo_special_scenarios, scenarios):
-        for name, pipeline in self._pipelines_descriptions:
-            for scenario in scenarios:
-                fname = self.get_fname(scenario, name=name)
+        for description in self._pipelines_descriptions:
+            name = description[0]
+            pipeline = description[1]
+            if len(description) == 3:
+                extra_datas = description[2]
+            else:
+                extra_datas = {}
+
+            for scenario in extra_datas.get('scenarios', scenarios):
+                if isinstance(scenario, str):
+                    scenario = self.test_manager.scenarios_manager.get_scenario(scenario)
+
+                mediainfo = FakeMediaDescriptor(extra_datas, pipeline)
+                if not mediainfo.is_compatible(scenario):
+                    continue
+
+                if self.test_manager.options.mute:
+                    if scenario and scenario.needs_clock_sync():
+                        fakesink = "fakesink sync=true"
+                    else:
+                        fakesink = "fakesink"
+
+                    audiosink = videosink = fakesink
+                else:
+                    audiosink = 'autoaudiosink'
+                    videosink = 'autovideosink'
+
+                pipeline_desc = pipeline % {'videosink': videosink,
+                                       'audiosink': audiosink}
+
+                fname = self.get_fname(scenario, protocol=mediainfo.get_protocol(), name=name)
+
                 self.add_test(GstValidateLaunchTest(fname,
                                                     self.test_manager.options,
                                                     self.test_manager.reporter,
-                                                    pipeline,
-                                                    scenario=scenario)
+                                                    pipeline_desc,
+                                                    scenario=scenario,
+                                                    media_descriptor=mediainfo)
                               )
 
 
@@ -171,6 +246,7 @@ class GstValidatePlaybinTestsGenerator(GstValidatePipelineTestsGenerator):
             protocol = minfo.media_descriptor.get_protocol()
 
             pipe += " uri=%s" % uri
+
             for scenario in special_scenarios + scenarios:
                 cpipe = pipe
                 if not minfo.media_descriptor.is_compatible(scenario):
@@ -254,21 +330,24 @@ class GstValidateMixerTestsGenerator(GstValidatePipelineTestsGenerator):
             else:
                 pipe_arguments = {"mixer": self.mixer}
 
-            if self.test_manager.options.mute:
-                pipe_arguments["sink"] = "'fakesink'"
-            else:
-                pipe_arguments["sink"] = "auto%ssink" % self.media_type
-
-            pipe = self._pipeline_template % pipe_arguments
-
-            for src in srcs:
-                pipe += "%s ! _mixer. " % src
-
             for scenario in scenarios:
                 fname = self.get_fname(scenario, Protocols.FILE) + "."
                 fname += name
 
                 self.debug("Adding: %s", fname)
+
+                if self.test_manager.options.mute:
+                    if scenario.needs_clock_sync():
+                        pipe_arguments["sink"] = "fakesink sync=true"
+                    else:
+                        pipe_arguments["sink"] = "'fakesink'"
+                else:
+                    pipe_arguments["sink"] = "auto%ssink" % self.media_type
+
+                pipe = self._pipeline_template % pipe_arguments
+
+                for src in srcs:
+                    pipe += "%s ! _mixer. " % src
 
                 self.add_test(GstValidateLaunchTest(fname,
                                                     self.test_manager.options,
@@ -281,7 +360,8 @@ class GstValidateMixerTestsGenerator(GstValidatePipelineTestsGenerator):
 class GstValidateLaunchTest(GstValidateTest):
 
     def __init__(self, classname, options, reporter, pipeline_desc,
-                 timeout=DEFAULT_TIMEOUT, scenario=None, media_descriptor=None):
+                 timeout=DEFAULT_TIMEOUT, scenario=None,
+                 media_descriptor=None, duration=0, hard_timeout=None):
         try:
             timeout = GST_VALIDATE_PROTOCOL_TIMEOUTS[
                 media_descriptor.get_protocol()]
@@ -290,7 +370,6 @@ class GstValidateLaunchTest(GstValidateTest):
         except AttributeError:
             pass
 
-        duration = 0
         if scenario:
             duration = scenario.get_duration()
         elif media_descriptor:
@@ -301,7 +380,8 @@ class GstValidateLaunchTest(GstValidateTest):
                                                   options, reporter,
                                                   duration=duration,
                                                   scenario=scenario,
-                                                  timeout=timeout)
+                                                  timeout=timeout,
+                                                  hard_timeout=hard_timeout)
 
         self.pipeline_desc = pipeline_desc
         self.media_descriptor = media_descriptor
@@ -309,7 +389,7 @@ class GstValidateLaunchTest(GstValidateTest):
     def build_arguments(self):
         GstValidateTest.build_arguments(self)
         self.add_arguments(self.pipeline_desc)
-        if self.media_descriptor is not None:
+        if self.media_descriptor is not None and self.media_descriptor.get_path():
             self.add_arguments(
                 "--set-media-info", self.media_descriptor.get_path())
 

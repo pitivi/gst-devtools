@@ -188,8 +188,15 @@ GST_LICENSE="LGPL"
 AC_DEFINE_UNQUOTED(GST_LICENSE, "$GST_LICENSE", [GStreamer license])
 AC_SUBST(GST_LICENSE)
 
-dnl set location of plugin directory
-AG_GST_SET_PLUGINDIR
+dnl define location of plugin directory
+AS_AC_EXPAND(PLUGINDIR, ${libdir}/gstreamer-$GST_API_VERSION/validate)
+AC_DEFINE_UNQUOTED(PLUGINDIR, "$PLUGINDIR",
+[directory where GstValidate plugins are located])
+AC_MSG_NOTICE([Using $PLUGINDIR as the plugin install location for GstValidate])
+
+dnl plugin directory configure-time variable for use in Makefile.am
+plugindir="\$(libdir)/gstreamer-$GST_API_VERSION/validate"
+AC_SUBST(plugindir)
 
 # set by AG_GST_PARSE_SUBSYSTEM_DISABLES above
 dnl make sure it doesn't complain about unused variables if debugging is disabled
@@ -235,10 +242,6 @@ GST_CFLAGS="$GST_CFLAGS \$(GST_OPTION_CFLAGS)"
 AC_SUBST(GST_CFLAGS)
 AC_SUBST(GST_LIBS)
 
-dnl Tiny library overriding calls such as socket recv / send
-FAULTINJECTION_LIBS="-L\$(top_srcdir)/fault_injection/ -lfaultinjection-$GST_API_VERSION"
-AC_SUBST([FAULTINJECTION_LIBS])
-
 dnl GST_ALL_*
 dnl vars common to for all internal objects (core libs, elements, applications)
 dnl CFLAGS:
@@ -279,11 +282,12 @@ Makefile
 common/Makefile
 common/m4/Makefile
 data/Makefile
-fault_injection/Makefile
 gst/Makefile
 gst/validate/Makefile
 gst/preload/Makefile
 gst/overrides/Makefile
+gst/plugins/Makefile
+gst/plugins/fault_injection/Makefile
 tests/Makefile
 tests/check/Makefile
 pkgconfig/Makefile

@@ -32,6 +32,8 @@ typedef guintptr GstValidateIssueId;
 
 G_BEGIN_DECLS
 
+typedef struct _GstValidateAction          GstValidateAction;
+
 GType           gst_validate_report_get_type (void);
 #define GST_TYPE_VALIDATE_REPORT (gst_validate_report_get_type ())
 
@@ -105,6 +107,7 @@ typedef enum {
 #define QUERY_POSITION_OUT_OF_SEGMENT            _QUARK("query::position-out-of-segment")
 
 #define SCENARIO_NOT_ENDED                       _QUARK("scenario::not-ended")
+#define SCENARIO_FILE_MALFORMED                  _QUARK("scenario::malformed")
 #define SCENARIO_ACTION_EXECUTION_ERROR          _QUARK("scenario::execution-error")
 #define SCENARIO_ACTION_EXECUTION_ISSUE          _QUARK("scenario::execution-issue")
 
@@ -213,6 +216,7 @@ const gchar *      gst_validate_report_level_get_name (GstValidateReportLevel le
 void               gst_validate_printf        (gpointer source,
                                                const gchar      * format,
                                                ...) G_GNUC_PRINTF (2, 3) G_GNUC_NO_INSTRUMENT;
+void               gst_validate_print_action  (GstValidateAction *action, const gchar * message);
 void               gst_validate_printf_valist (gpointer source,
                                                const gchar      * format,
                                                va_list            args) G_GNUC_NO_INSTRUMENT;

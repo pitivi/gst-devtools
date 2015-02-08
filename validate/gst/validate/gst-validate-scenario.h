@@ -48,7 +48,9 @@ enum
 {
   GST_VALIDATE_EXECUTE_ACTION_ERROR,
   GST_VALIDATE_EXECUTE_ACTION_OK,
-  GST_VALIDATE_EXECUTE_ACTION_ASYNC
+  GST_VALIDATE_EXECUTE_ACTION_ASYNC,
+  GST_VALIDATE_EXECUTE_ACTION_INTERLACED
+
 };
 
 /* TODO 2.0 -- Make it an actual enum type */
@@ -84,14 +86,16 @@ struct _GstValidateAction
   const gchar *type;
   const gchar *name;
   GstStructure *structure;
+  GstValidateScenario *scenario;
 
   /* < private > */
+  GstStructure *main_structure;
   guint action_number;
   gint repeat;
   GstClockTime playback_time;
   GstValidateExecuteActionReturn state; /* Actually ActionState */
 
-  gpointer _gst_reserved[GST_PADDING_LARGE - sizeof (gint)];
+  gpointer _gst_reserved[GST_PADDING_LARGE - sizeof (gint) - 2];
 };
 
 void gst_validate_action_set_done (GstValidateAction *action);
@@ -99,6 +103,64 @@ void gst_validate_action_set_done (GstValidateAction *action);
 #define GST_TYPE_VALIDATE_ACTION            (gst_validate_action_get_type ())
 #define GST_IS_VALIDATE_ACTION(obj)         (G_TYPE_CHECK_INSTANCE_TYPE ((obj), GST_TYPE_VALIDATE_ACTION))
 GType gst_validate_action_get_type (void);
+
+typedef struct _GstValidateActionType      GstValidateActionType;
+
+/**
+ * GstValidateActionTypeFlags:
+ * @GST_VALIDATE_ACTION_TYPE_NONE: No special flag
+ * @GST_VALIDATE_ACTION_TYPE_CONFIG: The action is a config
+ * @GST_VALIDATE_ACTION_TYPE_ASYNC: The action can be executed ASYNC
+ * @GST_VALIDATE_ACTION_TYPE_INTERLACED: The action will be executed async
+ *                                       but without blocking further actions
+ *                                       to be executed
+ * @GST_VALIDATE_ACTION_TYPE_CAN_EXECUTE_ON_ADDITION: The action will be executed on 'element-added'
+ *                                                 for a particular element type if no playback-time
+ *                                                 is specified
+ * @GST_VALIDATE_ACTION_TYPE_NEEDS_CLOCK: The pipeline will need to be synchronized with the clock
+ *                                        for that action type to be used.
+ * @GST_VALIDATE_ACTION_TYPE_NO_EXECUTION_NOT_FATAL: Do not concider the non execution of the action
+ *                                                   as a fatal error.
+ */
+typedef enum
+{
+    GST_VALIDATE_ACTION_TYPE_NONE = 0,
+    GST_VALIDATE_ACTION_TYPE_CONFIG = 1 << 1,
+    GST_VALIDATE_ACTION_TYPE_ASYNC = 1 << 2,
+    GST_VALIDATE_ACTION_TYPE_INTERLACED = 1 << 3,
+    GST_VALIDATE_ACTION_TYPE_CAN_EXECUTE_ON_ADDITION = 1 << 4,
+    GST_VALIDATE_ACTION_TYPE_NEEDS_CLOCK = 1 << 5,
+    GST_VALIDATE_ACTION_TYPE_NO_EXECUTION_NOT_FATAL = 1 << 6,
+} GstValidateActionTypeFlags;
+
+/**
+ * @name: The name of the new action type to add
+ * @implementer_namespace: The namespace of the implementer of the action type
+ * @execute: (virtual do_execute): The function to be called to execute the action
+ * @parameters: (allow-none) (array zero-terminated=1) (element-type GstValidate.ActionParameter): The #GstValidateActionParameter usable as parameter of the type
+ * @description: A description of the new type
+ * @flags: The flags of the action type
+ */
+struct _GstValidateActionType
+{
+  GstMiniObject          mini_object;
+
+  gchar *name;
+  gchar *implementer_namespace;
+
+  GstValidateExecuteAction execute;
+
+  GstValidateActionParameter *parameters;
+
+  gchar *description;
+  GstValidateActionTypeFlags flags;
+
+  gsize action_struct_size;
+  GstRank rank;
+
+  /*< private >*/
+  gpointer _gst_reserved[GST_PADDING_LARGE - sizeof(gsize) -  sizeof (GstRank)];
+};
 
 #define GST_TYPE_VALIDATE_ACTION_TYPE       (gst_validate_action_type_get_type ())
 #define GST_IS_VALIDATE_ACTION_TYPE(obj)    (G_TYPE_CHECK_INSTANCE_TYPE ((obj), GST_TYPE_VALIDATE_ACTION_TYPE))
@@ -164,17 +226,6 @@ struct _GstValidateScenario
   gpointer _gst_reserved[GST_PADDING];
 };
 
-/**
- * GstValidateActionTypeFlags:
- * @GST_VALIDATE_ACTION_TYPE_NONE: No special flag
- */
-typedef enum
-{
-    GST_VALIDATE_ACTION_TYPE_NONE = 0,
-    GST_VALIDATE_ACTION_TYPE_CONFIG = 1 << 1,
-    GST_VALIDATE_ACTION_TYPE_ASYNC = 1 << 2,
-} GstValidateActionTypeFlags;
-
 GType gst_validate_scenario_get_type (void);
 
 GstValidateScenario * gst_validate_scenario_factory_create (GstValidateRunner *runner,
@@ -185,13 +236,30 @@ gst_validate_list_scenarios       (gchar **scenarios,
                                    gint num_scenarios,
                                    gchar * output_file);
 
-void gst_validate_register_action_type (const gchar *type_name,
+GstValidateActionType *
+gst_validate_get_action_type           (const gchar *type_name);
+
+GstValidateActionType *
+gst_validate_register_action_type      (const gchar *type_name,
                                         const gchar *implementer_namespace,
                                         GstValidateExecuteAction function,
                                         GstValidateActionParameter * parameters,
                                         const gchar *description,
                                         GstValidateActionTypeFlags flags);
 
+GstValidateActionType *
+gst_validate_register_action_type_dynamic (GstPlugin *plugin,
+                                           const gchar * type_name,
+                                           GstRank rank,
+                                           GstValidateExecuteAction function,
+                                           GstValidateActionParameter * parameters,
+                                           const gchar * description,
+                                           GstValidateActionTypeFlags flags);
+
+
+void
+gst_validate_action_type_set_action_struct_size (GstValidateActionType *type,
+                                                 gsize action_struct_size);
 
 gboolean gst_validate_action_get_clocktime (GstValidateScenario * scenario,
                                             GstValidateAction *action,
@@ -207,6 +275,9 @@ gboolean gst_validate_scenario_execute_seek (GstValidateScenario *scenario,
                                              GstClockTime start,
                                              GstSeekType stop_type,
                                              GstClockTime stop);
+
+GstValidateAction *
+gst_validate_scenario_get_next_action       (GstValidateScenario *scenario);
 
 G_END_DECLS
 

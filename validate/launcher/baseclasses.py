@@ -21,13 +21,14 @@
 
 import os
 import sys
-import imp
 import re
 import time
 import utils
 import signal
 import urlparse
 import subprocess
+import threading
+import Queue
 import reporters
 import ConfigParser
 import loggable
@@ -59,6 +60,9 @@ class Test(Loggable):
         self.command = ""
         self.reporter = reporter
         self.process = None
+        self.proc_env = None
+        self.thread = None
+        self.queue = None
         self.duration = duration
 
         self.clean()
@@ -70,6 +74,7 @@ class Test(Loggable):
         self._starting_time = None
         self.result = Result.NOT_RUN
         self.logfile = None
+        self.out = None
         self.extra_logfiles = []
         self._env_variable = ''
 
@@ -99,15 +104,40 @@ class Test(Loggable):
             self._env_variable += " "
         self._env_variable += "%s=%s" % (variable, value)
 
-    def get_extra_log_content(self, extralog):
-        if extralog not in self.extra_logfiles:
-            return ""
+    def open_logfile(self):
+        path = os.path.join(self.options.logsdir,
+                            self.classname.replace(".", os.sep))
+        mkdir(os.path.dirname(path))
+        self.logfile = path
 
-        f = open(extralog, 'r+')
+        if self.options.redirect_logs == 'stdout':
+            self.out = sys.stdout
+        elif self.options.redirect_logs == 'stderr':
+            self.out = sys.stderr
+        else:
+            self.out = open(path, 'w+')
+
+    def close_logfile(self):
+        if not self.options.redirect_logs:
+            self.out.close()
+
+        self.out = None
+
+    def _get_file_content(self, file_name):
+        f = open(file_name, 'r+')
         value = f.read()
         f.close()
 
         return value
+
+    def get_log_content(self):
+        return self._get_file_content(self.logfile)
+
+    def get_extra_log_content(self, extralog):
+        if extralog not in self.extra_logfiles:
+            return ""
+
+        return self._get_file_content(extralog)
 
     def get_classname(self):
         name = self.classname.split('.')[-1]
@@ -162,57 +192,57 @@ class Test(Loggable):
         """
         return Result.NOT_RUN
 
-    def wait_process(self):
-        last_val = 0
-        last_change_ts = time.time()
-        start_ts = time.time()
-        while True:
-            self.process.poll()
-            if self.process.returncode is not None:
-                break
+    def process_update(self):
+        """
+        Returns True when process has finished running or has timed out.
+        """
 
-            # Dirty way to avoid eating to much CPU...
-            # good enough for us anyway.
-            time.sleep(1)
+        if self.process is None:
+            # Process has not started running yet
+            return False
 
-            val = self.get_current_value()
+        self.process.poll()
+        if self.process.returncode is not None:
+            return True
 
-            self.debug("Got value: %s" % val)
-            if val is Result.NOT_RUN:
-                # The get_current_value logic is not implemented... dumb
-                # timeout
-                if time.time() - last_change_ts > self.timeout:
-                    self.set_result(Result.TIMEOUT)
-                    break
-                continue
-            elif val is Result.FAILED:
-                break
-            elif val is Result.KNOWN_ERROR:
-                break
+        val = self.get_current_value()
 
-            self.log("New val %s" % val)
+        self.debug("Got value: %s" % val)
+        if val is Result.NOT_RUN:
+            # The get_current_value logic is not implemented... dumb
+            # timeout
+            if time.time() - self.last_change_ts > self.timeout:
+                self.set_result(Result.TIMEOUT)
+                return True
+            return False
+        elif val is Result.FAILED:
+            return True
+        elif val is Result.KNOWN_ERROR:
+            return True
 
-            if val == last_val:
-                delta = time.time() - last_change_ts
-                self.debug("%s: Same value for %d/%d seconds" %
-                           (self, delta, self.timeout))
-                if delta > self.timeout:
-                    self.set_result(Result.TIMEOUT)
-                    break
-            elif self.hard_timeout and time.time() - start_ts > self.hard_timeout:
-                self.set_result(
-                    Result.TIMEOUT, "Hard timeout reached: %d secs" % self.hard_timeout)
-                break
-            else:
-                last_change_ts = time.time()
-                last_val = val
+        self.log("New val %s" % val)
 
-        self.check_results()
+        if val == self.last_val:
+            delta = time.time() - self.last_change_ts
+            self.debug("%s: Same value for %d/%d seconds" %
+                       (self, delta, self.timeout))
+            if delta > self.timeout:
+                self.set_result(Result.TIMEOUT)
+                return True
+        elif self.hard_timeout and time.time() - self.start_ts > self.hard_timeout:
+            self.set_result(
+                Result.TIMEOUT, "Hard timeout reached: %d secs" % self.hard_timeout)
+            return True
+        else:
+            self.last_change_ts = time.time()
+            self.last_val = val
+
+        return False
 
     def get_subproc_env(self):
         return os.environ
 
-    def _kill_subprocess(self):
+    def kill_subprocess(self):
         if self.process is None:
             return
 
@@ -231,11 +261,24 @@ class Test(Loggable):
                                    % DEFAULT_TIMEOUT)
             res = self.process.poll()
 
-    def run(self):
+    def thread_wrapper(self):
+        self.process = subprocess.Popen("exec " + self.command,
+                                        stderr=self.out,
+                                        stdout=self.out,
+                                        shell=True,
+                                        env=self.proc_env)
+        self.process.wait()
+        if self.result is not Result.TIMEOUT:
+            self.queue.put(None)
+
+    def test_start(self, queue):
+        self.open_logfile()
+
+        self.queue = queue
         self.command = "%s " % (self.application)
         self._starting_time = time.time()
         self.build_arguments()
-        proc_env = self.get_subproc_env()
+        self.proc_env = self.get_subproc_env()
 
         message = "Launching: %s%s\n" \
                   "    Command: '%s %s'\n" % (Colors.ENDC, self.classname,
@@ -246,32 +289,32 @@ class Test(Loggable):
             for log in self.extra_logfiles:
                 message += "\n         - %s" % log
 
-            self.reporter.out.write("=================\n"
-                                    "Test name: %s\n"
-                                    "Command: '%s'\n"
-                                    "=================\n\n"
-                                    % (self.classname, self.command))
-            self.reporter.out.flush()
+            self.out.write("=================\n"
+                           "Test name: %s\n"
+                           "Command: '%s'\n"
+                           "=================\n\n"
+                           % (self.classname, self.command))
+            self.out.flush()
 
         printc(message, Colors.OKBLUE)
 
-        try:
-            self.process = subprocess.Popen("exec " + self.command,
-                                            stderr=self.reporter.out,
-                                            stdout=self.reporter.out,
-                                            shell=True,
-                                            env=proc_env)
-            self.wait_process()
-        except KeyboardInterrupt:
-            self._kill_subprocess()
-            raise
+        self.thread = threading.Thread(target=self.thread_wrapper)
+        self.thread.start()
 
-        self._kill_subprocess()
+        self.last_val = 0
+        self.last_change_ts = time.time()
+        self.start_ts = time.time()
+
+    def test_end(self):
+        self.kill_subprocess()
+        self.thread.join()
         self.time_taken = time.time() - self._starting_time
 
-        printc("Result: %s%s\n" % (self.result,
+        printc("%s: %s%s\n" % (self.classname, self.result,
                " (" + self.message + ")" if self.message else ""),
                color=utils.get_color_for_result(self.result))
+
+        self.close_logfile()
 
         return self.result
 
@@ -636,6 +679,10 @@ class TestsManager(Loggable):
         self.wanted_tests_patterns = []
         self.blacklisted_tests_patterns = []
         self._generators = []
+        self.queue = Queue.Queue()
+        self.jobs = []
+        self.total_num_tests = 0
+        self.starting_test_num = 0
 
     def init(self):
         return False
@@ -735,19 +782,73 @@ class TestsManager(Loggable):
 
         return False
 
-    def run_tests(self, cur_test_num, total_num_tests):
-        i = cur_test_num
-        for test in self.tests:
-            sys.stdout.write("[%d / %d] " % (i + 1, total_num_tests))
-            self.reporter.before_test(test)
-            res = test.run()
-            i += 1
-            self.reporter.after_test()
+    def test_wait(self):
+        while True:
+            # Check process every second for timeout
+            try:
+                self.queue.get(timeout=1)
+            except Queue.Empty:
+                pass
+
+            for test in self.jobs:
+                if test.process_update():
+                    self.jobs.remove(test)
+                    return test
+
+    def tests_wait(self):
+        try:
+            test = self.test_wait()
+            test.check_results()
+        except KeyboardInterrupt:
+            for test in self.jobs:
+                test.kill_subprocess()
+            raise
+
+        return test
+
+    def start_new_job(self, tests_left):
+        try:
+            test = tests_left.pop(0)
+        except IndexError:
+            return False
+
+        self.print_test_num(test)
+        test.test_start(self.queue)
+
+        self.jobs.append(test)
+
+        return True
+
+    def run_tests(self, starting_test_num, total_num_tests):
+        self.total_num_tests = total_num_tests
+        self.starting_test_num = starting_test_num
+
+        num_jobs = min(self.options.num_jobs, len(self.tests))
+        tests_left = list(self.tests)
+        jobs_running = 0
+
+        for i in range(num_jobs):
+            if not self.start_new_job(tests_left):
+                break
+            jobs_running += 1
+
+        while jobs_running != 0:
+            test = self.tests_wait()
+            jobs_running -= 1
+            self.print_test_num(test)
+            res = test.test_end()
+            self.reporter.after_test(test)
             if res != Result.PASSED and (self.options.forever or
                                          self.options.fatal_error):
                 return test.result
+            if self.start_new_job(tests_left):
+                jobs_running += 1
 
         return Result.PASSED
+
+    def print_test_num(self, test):
+        cur_test_num = self.starting_test_num + self.tests.index(test) + 1
+        sys.stdout.write("[%d / %d] " % (cur_test_num, self.total_num_tests))
 
     def clean_tests(self):
         for test in self.tests:
@@ -808,6 +909,7 @@ class _TestsLauncher(Loggable):
         if env_dirs is not None:
             for dir_ in env_dirs.split(":"):
                 app_dirs.append(dir_)
+                sys.path.append(dir_)
 
         return app_dirs
 
@@ -953,13 +1055,13 @@ class _TestsLauncher(Loggable):
             if not self._other_testsuite_for_tester(testsuite, tester):
                 try:
                     testlist_file = open(os.path.splitext(testsuite.__file__)[0] + ".testslist",
-                                    'rw')
+                                         'rw')
 
                     know_tests = testlist_file.read().split("\n")
                     testlist_file.close()
 
                     testlist_file = open(os.path.splitext(testsuite.__file__)[0] + ".testslist",
-                                    'w')
+                                         'w')
                 except IOError:
                     return
 
@@ -990,6 +1092,7 @@ class _TestsLauncher(Loggable):
         for tester in self.testers:
             total_num_tests += len(tester.list_tests())
 
+        self.reporter.init_timer()
         for tester in self.testers:
             res = tester.run_tests(cur_test_num, total_num_tests)
             cur_test_num += len(tester.list_tests())
@@ -1103,9 +1206,9 @@ class ScenarioManager(Loggable):
     def find_special_scenarios(self, mfile):
         scenarios = []
         mfile_bname = os.path.basename(mfile)
+
         for f in os.listdir(os.path.dirname(mfile)):
-            if re.findall("%s\..*\.%s$" % (mfile_bname, self.FILE_EXTENDION),
-                          f):
+            if re.findall("%s\..*\.%s$" % (mfile_bname, self.FILE_EXTENDION), f):
                 scenarios.append(os.path.join(os.path.dirname(mfile), f))
 
         if scenarios:
@@ -1138,7 +1241,10 @@ class ScenarioManager(Loggable):
         for section in config.sections():
             if scenario_paths:
                 for scenario_path in scenario_paths:
-                    if section in scenario_path:
+                    if mfile is None:
+                        name = section
+                        path = scenario_path
+                    elif section in scenario_path:
                         # The real name of the scenario is:
                         # filename.REALNAME.scenario
                         name = scenario_path.replace(mfile + ".", "").replace(
@@ -1157,6 +1263,12 @@ class ScenarioManager(Loggable):
         return scenarios
 
     def get_scenario(self, name):
+        if name is not None and os.path.isabs(name) and name.endswith(self.FILE_EXTENDION):
+            scenarios = self.discover_scenarios([name])
+
+            if scenarios:
+                return scenarios[0]
+
         if self.discovered is False:
             self.discover_scenarios()
 
@@ -1246,7 +1358,13 @@ class MediaDescriptor(Loggable):
     def get_num_tracks(self, track_type):
         raise NotImplemented
 
+    def can_play_reverse(self):
+        raise NotImplemented
+
     def is_compatible(self, scenario):
+        if scenario is None:
+            return True
+
         if scenario.seeks() and (not self.is_seekable() or self.is_image()):
             self.debug("Do not run %s as %s does not support seeking",
                        scenario, self.get_uri())
@@ -1255,6 +1373,9 @@ class MediaDescriptor(Loggable):
         if self.is_image() and scenario.needs_clock_sync():
             self.debug("Do not run %s as %s is an image",
                        scenario, self.get_uri())
+            return False
+
+        if not self.can_play_reverse() and scenario.does_reverse_playback():
             return False
 
         if self.get_duration() / GST_SECOND < scenario.get_min_media_duration():
@@ -1367,6 +1488,9 @@ class GstValidateMediaDescriptor(MediaDescriptor):
 
     def is_seekable(self):
         return self.media_xml.attrib["seekable"]
+
+    def can_play_reverse(self):
+        return True
 
     def is_image(self):
         for stream in self.media_xml.findall("streams")[0].findall("stream"):
