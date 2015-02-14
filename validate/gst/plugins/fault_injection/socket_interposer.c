@@ -24,8 +24,12 @@
 
 #define _GNU_SOURCE
 
-#include "socket_interposer.h"
-#include <gst/validate/gst-validate-scenario.h>
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <gst/gst.h>
+#include "../../validate/gst-validate-scenario.h"
 
 #if defined(__gnu_linux__) && !defined(__ANDROID__) && !defined (ANDROID)
 
@@ -326,34 +330,59 @@ _execute_corrupt_socket_recv (GstValidateScenario * scenario,
 
   socket_interposer_set_callback (&addr,
       (socket_interposer_callback) socket_callback_, action);
+
   return GST_VALIDATE_EXECUTE_ACTION_ASYNC;
 }
 
-void
-socket_interposer_init (void)
+static gboolean
+socket_interposer_init (GstPlugin * plugin)
 {
-  gst_validate_register_action_type ("corrupt-socket-recv", "fault-injector",
+/*  *INDENT-OFF* */
+  gst_validate_register_action_type_dynamic (plugin, "corrupt-socket-recv",
+      GST_RANK_PRIMARY,
       _execute_corrupt_socket_recv, ((GstValidateActionParameter[]) {
             {
-            .name = "port",.description =
-              "The port the socket to be corrupted listens on",.mandatory =
-              TRUE,.types = "int",.possible_variables = NULL,}, {
-            .name = "errno",.description =
-              "errno to set when failing",.mandatory = TRUE,.types =
-              "string",}, {
-            .name = "times",.description =
-              "Number of times to corrupt recv, default is one",.mandatory =
-              FALSE,.types = "int",.possible_variables = NULL,.def = "1",}, {
-            NULL}
+              .name = "port",
+              .description = "The port the socket to be corrupted listens on",
+              .mandatory = TRUE,
+              .types = "int",
+              .possible_variables = NULL,
+            },
+            {
+              .name = "errno",
+              .description = "errno to set when failing",
+              .mandatory = TRUE,
+              .types = "string",
+            },
+            {
+              .name = "times",
+              .description = "Number of times to corrupt recv, default is one",
+              .mandatory = FALSE,
+              .types = "int",
+              .possible_variables = NULL,
+              .def = "1",
+            },
+            {NULL}
           }),
       "corrupt the next socket receive", GST_VALIDATE_ACTION_TYPE_ASYNC);
+/*  *INDENT-ON* */
+
+  return TRUE;
 }
 
 #else /* No LD_PRELOAD tricks on Windows */
 
-void
-socket_interposer_init (void)
+static gboolean
+socket_interposer_init (GstPlugin * plugin)
 {
+  return TRUE;
 }
 
 #endif
+
+GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
+    GST_VERSION_MINOR,
+    faultinjector,
+    "Fault injector plugin for GstValidate",
+    socket_interposer_init, VERSION, "LGPL", GST_PACKAGE_NAME,
+    GST_PACKAGE_ORIGIN)
